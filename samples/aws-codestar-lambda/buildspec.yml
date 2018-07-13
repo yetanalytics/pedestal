@@ -12,7 +12,7 @@ phases:
       - LEIN_ROOT=true lein uberjar
       - mv target/pedestal-lambda-0.0.1-SNAPSHOT-standalone.jar .
       - jar xf pedestal-lambda-0.0.1-SNAPSHOT-standalone.jar
-      - rm -rf target src buildspec.yml project.clj pom.xml pedestal-lambda-0.0.1-SNAPSHOT-standalone.jar.jar
+      - rm -rf target src buildspec.yml project.clj pom.xml pedestal-lambda-0.0.1-SNAPSHOT-standalone.jar
       - aws cloudformation package --template template.yml --s3-bucket $S3_BUCKET --output-template template-export.json
 artifacts:
   files:
