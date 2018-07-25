@@ -1,16 +1,103 @@
 (ns io.pedestal.http.aws.lambda.utils
   (:require [clojure.string :as string]
-            [io.pedestal.interceptor.chain :as chain])
+            [io.pedestal.interceptor.chain :as chain]
+            [io.pedestal.http.impl.servlet-interceptor :as servlet-utils]
+            [clojure.core.async :as a]
+            [io.pedestal.log :as log])
   (:import (java.io ;InputStream
                     ;OutputStream
                     ;InputStreamReader
                     ;PushbackReader
                     ByteArrayInputStream
-                    ByteArrayOutputStream)
+                    ByteArrayOutputStream
+                    EOFException)
            (com.amazonaws.services.lambda.runtime Context
                                                   RequestHandler
-                                                  RequestStreamHandler)))
+                                                  RequestStreamHandler)
+           (java.util LinkedHashMap)))
 
+;; for processing headers
+(extend-protocol clojure.core.protocols/IKVReduce
+  java.util.LinkedHashMap
+  (kv-reduce
+    [amap f init]
+    (let [^java.util.Iterator iter (.. amap entrySet iterator)]
+      (loop [ret init]
+        (if (.hasNext iter)
+          (let [^java.util.Map$Entry kv (.next iter)
+                ret (f ret (.getKey kv) (.getValue kv))]
+            (if (reduced? ret)
+              @ret
+              (recur ret)))
+          ret)))))
+
+;; For processing body channels
+(extend-protocol servlet-utils/WriteableBody
+  clojure.core.async.impl.protocols.Channel
+  (default-content-type [_]
+    "application/octet-stream")
+  (write-body-to-stream [chan ^ByteArrayOutputStream output-stream]
+    (loop []
+      (when-let [body-part (a/<!! chan)]
+        (try
+          (servlet-utils/write-body-to-stream body-part output-stream)
+          (catch Throwable t
+            ;; Defend against exhausting core.async thread pool
+            ;;  -- ASYNC-169 :: http://dev.clojure.org/jira/browse/ASYNC-169
+            (if (instance? EOFException t)
+              (log/warn :msg "The pipe closed while async writing to the client; Client most likely disconnected."
+                        :exception t
+                        :src-chan chan)
+              (do (log/meter ::servlet-utils/async-write-errors)
+                  (log/error :msg "An error occured when async writing to the client"
+                             :throwable t
+                             :src-chan chan)))
+            ;; Only close the body-ch eagerly in the failure case
+            ;;  otherwise the producer (web app) is expected to close it
+            ;;  when they're done.
+            (a/close! chan)))
+        (recur)))))
+
+
+;; For Async interceptors
+(defn prepare-for-async
+  "Call all of the :enter-async functions in a context. The purpose of these
+  functions is to ready backing servlets or any other machinery for preparing
+  an asynchronous response."
+  [{:keys [enter-async] :as context}]
+  (doseq [enter-async-fn enter-async]
+    (enter-async-fn context)))
+
+(defn go-async!!
+  "When presented with a channel as the return value of an enter function,
+  wait for the channel to return a new-context (via a go block). When a new
+  context is received, restart execution of the interceptor chain with that
+  context.
+
+  This function is *blocking*"
+  ([old-context context-channel]
+   (prepare-for-async old-context)
+   (if-let [new-context (a/<!! context-channel)]
+     (chain/execute new-context)
+     (chain/execute (assoc (dissoc old-context ::chain/queue ::chain/async-info)
+                           ::chain/stack (get-in old-context [::chain/async-info :stack])
+                           ::chain/error (ex-info "Async Interceptor closed Context Channel before delivering a Context"
+                                                  {:execution-id (::chain/execution-id old-context)
+                                                   :stage (get-in old-context [::chain/async-info :stage])
+                                                   :interceptor (name (get-in old-context [::chain/async-info :interceptor]))
+                                                   :exception-type :PedestalChainAsyncPrematureClose})))))
+  ([old-context context-channel interceptor-key]
+   (prepare-for-async old-context)
+   (if-let [new-context (a/<!! context-channel)]
+     (chain/execute-only new-context interceptor-key)
+     (chain/execute-only (assoc (dissoc old-context ::chain/queue ::chain/async-info)
+                                ::chain/stack (get-in old-context [::chain/async-info :stack])
+                                ::chain/error (ex-info "Async Interceptor closed Context Channel before delivering a Context"
+                                                       {:execution-id (::chain/execution-id old-context)
+                                                        :stage (get-in old-context [::chain/async-info :stage])
+                                                        :interceptor (name (get-in old-context [::chain/async-info :interceptor]))
+                                                        :exception-type :PedestalChainAsyncPrematureClose}))
+                         interceptor-key))))
 
 (defn apigw-request-map
   "Given a parsed JSON event from API Gateway,
@@ -25,16 +112,23 @@
   ([apigw-event]
    (apigw-request-map apigw-event true))
   ([apigw-event process-headers?]
+   (log/debug :msg "APIGW Event" :event apigw-event)
    (let [path (get apigw-event "path" "/")
          headers (get apigw-event "headers" {})
          [http-version host] (string/split (get headers "Via" "") #" ")
          port (try (Integer/parseInt (get headers "X-Forwarded-Port" "")) (catch Throwable t 80))
-         source-ip (get-in apigw-event ["requestContext" "identity" "sourceIp"] "")]
+         source-ip (get-in apigw-event ["requestContext" "identity" "sourceIp"] "")
+         body-raw (or (get apigw-event "body") "")
+         body-bytes (.getBytes ^String body-raw "UTF-8")]
      {:server-port port
       :server-name (or host "")
       :remote-addr source-ip
       :uri path
-      ;:query-string query-string
+                                        ;:query-string query-string
+      :content-length (count body-bytes)
+      :content-type (or (get headers "Content-Type")
+                        (get headers "content-type")
+                        "application/octet-stream")
       :query-string-params (get apigw-event "queryStringParameters")
       :path-params (get apigw-event "pathParameters" {})
       :scheme (get headers "X-Forwarded-Proto" "http")
@@ -43,13 +137,16 @@
                               keyword)
       :headers (if process-headers?
                  (persistent! (reduce (fn [hs [k v]]
-                                        (assoc! hs (string/lower-case k) v))
+                                        (assoc! hs
+                                                ;; original
+                                                k v
+                                                ;; normalized
+                                                (string/lower-case k) v))
                                       (transient {})
                                       headers))
                  headers)
       ;:ssl-client-cert ssl-client-cert
-      :body (when-let [body (get apigw-event "body")]
-              (ByteArrayInputStream. (.getBytes ^String body "UTF-8")))
+      :body (ByteArrayInputStream. body-bytes)
       :path-info path
       :protocol (str "HTTP/" (or http-version "1.1"))
       :async-supported? false})))
@@ -63,12 +160,12 @@
    (apigw-response ring-response identity))
   ([ring-response body-process-fn]
    (let [{:keys [status body headers]} ring-response
-        processed-body (body-process-fn body)
-                       ;(if (string? body)
-                       ;  body
-                       ;  (->> (ByteArrayOutputStream.)
-                       ;       (servlet-utils/write-body-to-stream body)
-                       ;       (.toString)))
+        processed-body ;; (body-process-fn body)
+                       (if (string? body)
+                         body
+                         (with-open [baos (ByteArrayOutputStream.)]
+                           (servlet-utils/write-body-to-stream body baos)
+                           (.toString baos)))
                        ]
     {"statusCode" (or status (if (string/blank? processed-body) 400 200))
      "body" processed-body
@@ -114,11 +211,15 @@
                                                                         (map? (:headers resp))))
                                                                 #(map? (:apigw-response %))]}
                                           default-context)
-                   response-context (chain/execute initial-context interceptors)
-                   response-map (or (:apigw-response response-context)
-                                    ;; Use `or` to prevent evaluation
-                                    (some-> (:response response-context)
-                                            (apigw-response body-processor)))]
+                   response-context (with-redefs [io.pedestal.interceptor.chain/go-async go-async!!]
+                                      (chain/execute initial-context interceptors))
+                   response-map (cond-> (or (:apigw-response response-context)
+                                            ;; Use `or` to prevent evaluation
+                                            (some-> (:response response-context)
+                                                    (apigw-response body-processor)))
+                                  (= :head
+                                     (:request-method request))
+                                  (assoc "body" ""))]
                response-map)))))
 
 
